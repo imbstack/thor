@@ -14,3 +14,5 @@ from thor.tcp import TcpClient, TcpServer
 from thor.udp import UdpEndpoint
 from thor.http.client import HttpClient
 from thor.http.server import HttpServer
+from thor.spdy.client import SpdyClient
+from thor.spdy.server import SpdyServer
