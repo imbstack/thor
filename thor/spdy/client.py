@@ -33,8 +33,8 @@ import thor
 from thor.events import EventEmitter, on
 from thor.tcp import TcpClient
 
-from error import ERR_CONNECT, ERR_URL
-from http_common import WAITING, hop_by_hop_hdrs, dummy, get_hdr
+from thor.http.error import ConnectError, UrlError
+from thor.http.common import WAITING, hop_by_hop_hdrs, dummy, get_header
 from common import SpdyMessageHandler, CTL_SYN_STREAM, FLAG_NONE, FLAG_FIN
 
 req_remove_hdrs = hop_by_hop_hdrs + ['host']

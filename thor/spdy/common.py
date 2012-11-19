@@ -33,7 +33,7 @@ THE SOFTWARE.
 import struct
 
 import c_zlib
-from http_common import dummy
+from thor.http.common import dummy
 
 compressed_hdrs = True
 # There is a null character ('\0') at the end of the dictionary. The '\0' might
@@ -80,10 +80,10 @@ class SpdyMessageHandler:
     This is a base class for something that has to parse and/or serialise
     SPDY messages, request or response.
 
-    For parsing, it expects you to override _input_start, _input_body and
-    _input_end, and call _handle_input when you get bytes from the network.
+    For parsing, it expects you to override input_start, input_body and
+    input_end, and call handle_input when you get bytes from the network.
 
-    For serialising, it expects you to override _output.
+    For serialising, it expects you to override output.
     """
 
     def __init__(self):
@@ -102,26 +102,26 @@ class SpdyMessageHandler:
             self._decompress = dummy
 
     # input-related methods
-    def _input_start(self, stream_id, hdr_tuples):
+    def input_start(self, stream_id, hdr_tuples):
         """
         Take the top set of headers from a new request and queue it
         to be processed by the application.
         """
         raise NotImplementedError
 
-    def _input_body(self, stream_id, chunk):
+    def input_body(self, stream_id, chunk):
         "Process a body chunk from the wire."
         raise NotImplementedError
 
-    def _input_end(self, stream_id):
+    def input_end(self, stream_id):
         "Indicate that the response body is complete."
         raise NotImplementedError
 
-    def _input_error(self, stream_id, err, detail=None):
+    def input_error(self, stream_id, err, detail=None):
         "Indicate a parsing problem with the body."
         raise NotImplementedError
 
-    def _handle_input(self, data):
+    def handle_input(self, data):
         """
         Given a chunk of input, figure out what state we're in and handle it,
         making the appropriate calls.
@@ -143,7 +143,7 @@ class SpdyMessageHandler:
                     self._input_stream_id = d1 & STREAM_MASK
                 self._input_frame_len = (( d2 << 16 ) + d3)
                 self._input_state = READING_FRAME_DATA
-                self._handle_input(data[8:])
+                self.handle_input(data[8:])
             else:
                 self._input_buffer = data
         elif self._input_state == READING_FRAME_DATA:
@@ -151,7 +151,7 @@ class SpdyMessageHandler:
                 frame_data = data[:self._input_frame_len]
                 rest = data[self._input_frame_len:]
                 if self._input_frame_type == DATA_FRAME:
-                    self._input_body(self._input_stream_id, frame_data)
+                    self.input_body(self._input_stream_id, frame_data)
                     stream_id = self._input_stream_id # for FLAG_FIN below
                 elif self._input_frame_type in [CTL_SYN_STREAM, CTL_SYN_REPLY]:
                     stream_id = struct.unpack("!I", frame_data[:4])[0] & STREAM_MASK # FIXME: what if they lied about the frame len?
@@ -159,12 +159,12 @@ class SpdyMessageHandler:
                     if self._input_frame_type == CTL_SYN_STREAM:
                       associated_stream_id = struct.unpack("!I", frame_data[4:8])[0]
                       tuple_pos += 4
-                    hdr_tuples = self._parse_hdrs(frame_data[tuple_pos:]) or self._input_error(stream_id, 1) # FIXME: proper error here
+                    hdr_tuples = self._parse_hdrs(frame_data[tuple_pos:]) or self.input_error(stream_id, 1) # FIXME: proper error here
                     # FIXME: expose pri
-                    self._input_start(stream_id, hdr_tuples)
+                    self.input_start(stream_id, hdr_tuples)
                 elif self._input_frame_type == CTL_RST_STREAM:
                     stream_id = struct.unpack("!I", frame_data[:4])[0] & STREAM_MASK
-                    self._input_end(stream_id)
+                    self.input_end(stream_id)
                 elif self._input_frame_type == CTL_SETTINGS:
                     pass # FIXME
                 elif self._input_frame_type == CTL_NOOP:
@@ -176,10 +176,10 @@ class SpdyMessageHandler:
                 else: # unknown frame type
                     raise ValueError, "Unknown frame type" # FIXME: don't puke
                 if self._input_flags & FLAG_FIN: # FIXME: invalid on CTL_RST_STREAM
-                    self._input_end(stream_id)
+                    self.input_end(stream_id)
                 self._input_state = WAITING
                 if rest:
-                    self._handle_input(rest)
+                    self.handle_input(rest)
             else: # don't have complete frame yet
                 self._input_buffer = data
         else:
@@ -217,8 +217,19 @@ class SpdyMessageHandler:
 
     ### output-related methods
 
-    def _output(self, out):
+    def output(self, stream_id, out):
         raise NotImplementedError
+
+    def output_start(self, stream_id, hdr_tuples):
+        syn = self._ser_syn_frame(CTL_SYN_REPLY, FLAG_NONE, stream_id, hdr_tuples)
+        self.output(syn)
+        # TODO: make and do something with output_state here
+
+    def output_body(self, stream_id, chunk):
+        self.output(self._ser_data_frame(stream_id, FLAG_NONE, chunk))
+
+    def output_end(self, stream_id, trailers):
+        self.output(self._ser_data_frame(stream_id, FLAG_FIN, ""))
 
     def _handle_error(self, err):
         raise NotImplementedError
