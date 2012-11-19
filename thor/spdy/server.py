@@ -93,14 +93,18 @@ class SpdyServerConnection(SpdyMessageHandler, EventEmitter):
         "The server connection has closed."
         pass # FIXME: any cleanup necessary?
 #        self.pause()
-#        self.tcp_conn.handler = None
-#        self.tcp_conn = None
+#        self._tcp_conn.handler = None
+#        self._tcp_conn = None
 
     # Methods called by common.SpdyRequestHandler
 
     def output(self, chunk):
         if self._tcp_conn:
             self._tcp_conn.write(chunk)
+
+    def output_start(self, stream_id, hdr_tuples):
+        syn = self._ser_syn_frame(CTL_SYN_REPLY, FLAG_NONE, stream_id, hdr_tuples)
+        self.output(syn)
 
     def input_start(self, stream_id, hdr_tuples):
         method = get_header(hdr_tuples, 'method')[0] # FIXME: error handling

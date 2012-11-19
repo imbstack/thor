@@ -221,9 +221,7 @@ class SpdyMessageHandler:
         raise NotImplementedError
 
     def output_start(self, stream_id, hdr_tuples):
-        syn = self._ser_syn_frame(CTL_SYN_REPLY, FLAG_NONE, stream_id, hdr_tuples)
-        self.output(syn)
-        # TODO: make and do something with output_state here
+        raise NotImplementedError
 
     def output_body(self, stream_id, chunk):
         self.output(self._ser_data_frame(stream_id, FLAG_NONE, chunk))

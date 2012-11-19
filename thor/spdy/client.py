@@ -32,6 +32,7 @@ from urlparse import urlsplit
 import thor
 from thor.events import EventEmitter, on
 from thor.tcp import TcpClient
+# TODO: Add in TLS support
 
 from thor.http.error import ConnectError, UrlError
 from thor.http.common import WAITING, hop_by_hop_hdrs, dummy, get_header
@@ -41,7 +42,7 @@ req_remove_hdrs = hop_by_hop_hdrs + ['host']
 
 # TODO: read timeout support (needs to be in push_tcp?)
 
-class SpdyClient(SpdyMessageHandler):
+class SpdyClient(object):
     "An asynchronous SPDY client."
     proxy = None
     connect_timeout = None
@@ -53,7 +54,7 @@ class SpdyClient(SpdyMessageHandler):
         self.loop.on('stop', self._close_conns)
 
     def exchange(self):
-        return SpdyClientExchange(self)
+        return SpdyClientConn(self)
 
     def _attach_conn(self, host, port, handle_connect,
                handle_connect_error, connect_timeout):
@@ -109,93 +110,84 @@ class SpdyClient(SpdyMessageHandler):
         self._conns = {}
         # TODO: probably need to close in-progress conns too.
 
-    def req_start(self, method, uri, req_hdrs, res_start_cb, req_body_pause):
+class SpdyClientConn(SpdyMessageHandler, EventEmitter):
+
+    def __init__(self, client):
+        SpdyMessageHandler.__init__(self)
+        EventEmitter.__init__(self)
+        self.client = client
+        self.method = None
+        self.uri = None
+        self.req_hdrs = None
+        self.req_target = None
+        self.scheme = None
+        self.authority = None
+        self.res_version = None
+        self._tcp_conn = None
+        self._conn_reusable = False
+        self._req_body = False
+        self._req_started = False
+        self._retries = 0
+        self._read_timeout_ev = None
+        self._output_buffer = []
+        self._streams = {}
+        self._highest_stream_id = -1
+
+    def __repr__(self):
+        status = [self.__class__.__module__ + "." + self.__class__.__name__]
+        status.append('%s {%s}' % (self.method or "-", self.uri or "-"))
+        if self._tcp_conn:
+            status.append(
+              self._tcp_conn.tcp_connected and 'connected' or 'disconnected')
+        return "<%s at %#x>" % (", ".join(status), id(self))
+
+    def request_start(self, method, uri, req_hdrs):
         """
         Start a request to uri using method, where
         req_hdrs is a list of (field_name, field_value) for
         the request headers.
-
-        Returns a (req_body, req_done) tuple.
         """
-        if self.proxy:
-            (host, port) = self.proxy
-        else: # find out where to connect to the hard way
-            (scheme, authority, path, query, fragment) = urlsplit(uri)
-            if scheme.lower() != 'http':
-                self._handle_error(ERR_URL, "Only HTTP URLs are supported")
+        (scheme, authority, path, query, fragment) = urlsplit(uri)
+        if scheme.lower() != 'http':
+            self._handle_error(UrlError, "Only HTTP URLs are supported")
+        if "@" in authority:
+            userinfo, authority = authority.split("@", 1)
+        if ":" in authority:
+            host, port = authority.rsplit(":", 1)
+            try:
+                port = int(port)
+            except ValueError:
+                self._handle_error(UrlError, "Non-integer port in URL")
                 return dummy, dummy
-            if "@" in authority:
-                userinfo, authority = authority.split("@", 1)
-            if ":" in authority:
-                host, port = authority.rsplit(":", 1)
-                try:
-                    port = int(port)
-                except ValueError:
-                    self._handle_error(ERR_URL, "Non-integer port in URL")
-                    return dummy, dummy
-            else:
-                host, port = authority, 80
-        conn = _conn_pool.get(host, port, SpdyConnection, self.connect_timeout)
-        return conn.req_start(method, uri, req_hdrs, res_start_cb, req_body_pause)
+        else:
+            host, port = authority, 80
+        if not self._tcp_conn:
+            self.client._attach_conn(host, port, self._handle_connect,
+                    self._handle_connect_error, self.client.connect_timeout)
 
-
-class SpdyConnection(SpdyMessageHandler):
-    "A SPDY connection."
-
-    def __init__(self, log=None):
-        SpdyMessageHandler.__init__(self)
-        self.log = log or dummy
-        self._tcp_conn = None
-        self._req_body_pause_cb = None  # FIXME: re-think pausing
-        self._streams = {}
-        self._output_buffer = []
-        self._highest_stream_id = -1
-
-    def req_start(self, method, uri, req_hdrs, res_start_cb, req_body_pause):
         req_hdrs = [i for i in req_hdrs if not i[0].lower() in req_remove_hdrs]
         req_hdrs.append(('method', method))
         req_hdrs.append(('url', uri))
         req_hdrs.append(('version', 'HTTP/1.1'))
         self._highest_stream_id += 2 # TODO: check to make sure it's not too high.. what then?
         stream_id = self._highest_stream_id
-        self._streams[stream_id] = [res_start_cb, req_body_pause, None, None]
-        self._output(self._ser_syn_frame(CTL_SYN_STREAM, FLAG_NONE, stream_id, req_hdrs))
-        def req_body(*args):
-            return self.req_body(stream_id, *args)
-        def req_done(*args):
-            return self.req_done(stream_id, *args)
-        return req_body, req_done
+        exch = SpdyClientExchange(self, stream_id, method, uri, req_hdrs)
+        self._streams[stream_id] = exch
+        return stream_id
 
-    def req_body(self, stream_id, chunk):
-        "Send part of the request body. May be called zero to many times."
-        self._output(self._ser_data_frame(stream_id, FLAG_NONE, chunk))
 
-    def req_done(self, stream_id, err):
-        """
-        Signal the end of the request, whether or not there was a body. MUST be
-        called exactly once for each request.
+    # Methods called by tcp
 
-        If err is not None, it is an error dictionary (see the error module)
-        indicating that an HTTP-specific (i.e., non-application) error occurred
-        while satisfying the request; this is useful for debugging.
-        """
-        self._output(self._ser_data_frame(stream_id, FLAG_FIN, ""))
-        # TODO: delete stream after checking that input side is half-closed
-
-    def res_body_pause(self, paused):
-        "Temporarily stop / restart sending the response body."
-        if self._tcp_conn and self._tcp_conn.tcp_connected:
-            self._tcp_conn.pause(paused)
-
-    # Methods called by push_tcp
-
-    def handle_connect(self, tcp_conn):
+    def _handle_connect(self, tcp_conn):
         "The connection has succeeded."
         self._tcp_conn = tcp_conn
-        self._output("") # kick the output buffer
-        return self._handle_input, self._conn_closed, self._req_body_pause
+        tcp_conn.on('data', self.handle_input)
+        tcp_conn.on('close', self._conn_closed)
+        tcp_conn.on('pause', self._req_body_pause)
+        self.output("") # kick the output buffer
+        self._tcp_conn.pause(False)
 
-    def handle_connect_error(self, host, port, err):
+    def _handle_connect_error(self, host, port, err):
         "The connection has failed."
         import os, types, socket
         if type(err) == types.IntType:
@@ -204,12 +196,12 @@ class SpdyConnection(SpdyMessageHandler):
             err = err[1]
         else:
             err = str(err)
-        self._handle_error(ERR_CONNECT, err)
+        self._handle_error(ConnectError, err)
 
     def _conn_closed(self):
         "The server closed the connection."
         if self._input_buffer:
-            self._handle_input("")
+            self.handle_input("")
         # TODO: figure out what to do with existing conns
 
     def _req_body_pause(self, paused):
@@ -220,27 +212,30 @@ class SpdyConnection(SpdyMessageHandler):
 
     # Methods called by common.SpdyMessageHandler
 
-    def _input_start(self, stream_id, hdr_tuples):
+    def input_start(self, stream_id, hdr_tuples):
         """
         Take the top set of headers from the input stream, parse them
         and queue the request to be processed by the application.
         """
-        status = get_hdr(hdr_tuples, 'status')[0]
+        status = get_header(hdr_tuples, 'status')[0]
         try:
             res_code, res_phrase = status.split(None, 1)
         except ValueError:
             res_code = status.rstrip()
             res_phrase = ""
-        self._streams[stream_id][1:2] = self._streams[stream_id][0](
-            "HTTP/1.1", res_code, res_phrase, hdr_tuples, self.res_body_pause)
+        self._streams[stream_id].emit('response_start',
+                  res_code,
+                  res_phrase,
+                  hdr_tuples
+        )
 
-    def _input_body(self, stream_id, chunk):
+    def input_body(self, stream_id, chunk):
         "Process a response body chunk from the wire."
-        self._streams[stream_id][1](chunk)
+        self._streams[stream_id].emit('response_body', chunk)
 
-    def _input_end(self, stream_id):
+    def input_end(self, stream_id):
         "Indicate that the response body is complete."
-        self._streams[stream_id][2](None)
+        self._streams[stream_id].emit('response_done', "")
         # TODO: delete stream if output side is half-closed.
 
     def _input_error(self, err, detail=None):
@@ -251,7 +246,11 @@ class SpdyConnection(SpdyMessageHandler):
         err['detail'] = detail
         self.res_done_cb(err)
 
-    def _output(self, chunk):
+    def output_start(self, stream_id, hdr_tuples):
+        syn = self._ser_syn_frame(CTL_SYN_STREAM, FLAG_NONE, stream_id, hdr_tuples)
+        self.output(syn)
+
+    def output(self, chunk):
         self._output_buffer.append(chunk)
         if self._tcp_conn and self._tcp_conn.tcp_connected:
             self._tcp_conn.write("".join(self._output_buffer))
@@ -280,49 +279,75 @@ class SpdyConnection(SpdyMessageHandler):
         res_body_cb(str(body))
         push_tcp.schedule(0, res_done_cb, err)
 
+    def res_body_pause(self, paused):
+        "Temporarily stop / restart sending the response body."
+        if self._tcp_conn and self._tcp_conn.tcp_connected:
+            self._tcp_conn.pause(paused)
 
-class _SpdyConnectionPool:
-    "A pool of open connections for use by the client."
-    _conns = {}
+class SpdyClientExchange(EventEmitter):
 
-    def get(self, host, port, connection_handler, connect_timeout):
-        "Find a connection for (host, port), or create a new one."
-        try:
-            conn = self._conns[(host, port)]
-        except KeyError:
-            conn = connection_handler()
-            push_tcp.create_client(
-                host, port,
-                conn.handle_connect, conn.handle_connect_error,
-                connect_timeout
-            )
-            self._conns[(host, port)] = conn
-        return conn
+    def __init__(self, spdy_conn, stream_id, method, uri, req_hdrs):
+        EventEmitter.__init__(self)
+        self.spdy_conn = spdy_conn
+        self.method = method
+        self.uri = uri
+        self.req_hdrs = req_hdrs
+        self.stream_id = stream_id
+        self.started = False
+        self.request_start()
 
-    #TODO: remove conns from _conns when they close
+    def request_start(self):
+        self.started = True
+        self.spdy_conn.output_start(self.stream_id, self.req_hdrs)
 
-_conn_pool = _SpdyConnectionPool()
+    def request_body(self, stream_id, chunk):
+        "Send part of the request body. May be called zero to many times."
+        self.spdy_conn.output_body(stream_id, chunk)
 
+    def request_done(self, stream_id, err):
+        """
+        Signal the end of the request, whether or not there was a body. MUST be
+        called exactly once for each request.
 
-def test_client(request_uri):
-    "A simple demonstration of a client."
-    def printer(version, status, phrase, headers, res_pause):
+        If err is not None, it is an error dictionary (see the error module)
+        indicating that an HTTP-specific (i.e., non-application) error occurred
+        while satisfying the request; this is useful for debugging.
+        """
+        self.spdy_conn.output_end(stream_id, "")
+        # TODO: delete stream after checking that input side is half-closed
+
+def test_client(request_uri, out, err):
+    from thor.loop import stop, run
+
+    c = SpdyClient()
+    c.connect_timeout = 5
+    x = c.exchange()
+    stream = x.request_start("GET", request_uri, [])
+
+    @on(x._streams[stream])
+    def response_start(status, phrase, headers):
         "Print the response headers."
-        print "HTTP/%s" % version, status, phrase
+        print "HTTP/%s %s %s" % (x.res_version, status, phrase)
         print "\n".join(["%s:%s" % header for header in headers])
         print
-        def body(chunk):
-            print chunk
-        def done(err):
-            if err:
-                print "*** ERROR: %s (%s)" % (err['desc'], err['detail'])
-            push_tcp.stop()
-        return body, done
-    c = SpdyClient()
-    req_body_write, req_done = c.req_start("GET", request_uri, [], printer, dummy)
-    req_done(None)
-    push_tcp.run()
+
+    @on(x._streams[stream])
+    def error(err_msg):
+        if err_msg:
+            err("*** ERROR: %s (%s)\n" %
+                (err_msg.desc, err_msg.detail)
+            )
+        stop()
+
+    x._streams[stream].on('response_body', out)
+
+    @on(x._streams[stream])
+    def response_done(trailers):
+        stop()
+
+    x._streams[stream].request_done(stream, [])
+    run()
 
 if __name__ == "__main__":
     import sys
-    test_client(sys.argv[1])
+    test_client(sys.argv[1], sys.stdout.write, sys.stderr.write)
