@@ -35,7 +35,7 @@ import ctypes as C
 from ctypes import util
 
 # TODO: catch errors
-_zlib = C.cdll.LoadLibrary(util.find_library('libz'))
+_zlib = C.cdll.LoadLibrary(util.find_library('z'))
 
 class _z_stream(C.Structure):
     _fields_ = [
@@ -96,9 +96,10 @@ class Compressor:
         else:
             raise AssertionError, err # FIXME: more specific errors?
 
-    def __del__(self):
-        err = _zlib.deflateEnd(C.byref(self.st))
-        assert err == Z_OK, err # FIXME: more specific error
+    # FIXME: This is not a good idea to comment these out
+    #def __del__(self):
+    #    err = _zlib.deflateEnd(C.byref(self.st))
+    #    assert err == Z_OK, err # FIXME: more specific error
 
 
 class Decompressor:
@@ -135,6 +136,7 @@ class Decompressor:
         else:
             raise AssertionError, err # FIXME: more specific error
 
-    def __del__(self):
-        err = _zlib.inflateEnd(C.byref(self.st))
-        assert err == Z_OK, err # FIXME: more specific error
+    # FIXME: This is not a good idea to comment these out
+    #def __del__(self):
+    #    err = _zlib.inflateEnd(C.byref(self.st))
+    #    assert err == Z_OK, err # FIXME: more specific error
