@@ -12,7 +12,7 @@ setup(
   url = 'http://github.com/mnot/thor/',
   download_url = \
     'http://github.com/mnot/thor/tarball/thor-%s' % thor.__version__,
-  packages = ['thor', 'thor.http'],
+  packages = ['thor', 'thor.http', 'thor.spdy'],
   provides = ['thor'],
   long_description=open("README.rst").read(),
   classifiers = [
