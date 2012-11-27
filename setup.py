@@ -4,7 +4,7 @@ from distutils.core import setup
 import thor
 
 setup(
-  name = 'thor',
+  name = 'thor-spdy',
   version = thor.__version__,
   description = 'Simple Event-Driven IO for Python',
   author = 'Mark Nottingham',
