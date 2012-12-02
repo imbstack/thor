@@ -85,9 +85,7 @@ class SpdyServerConnection(SpdyMessageHandler, EventEmitter):
 
     def res_body_pause(self, paused):
         "Pause/unpause sending the response body."
-        # TODO: Perhaps add back in res_body_pause_cb in the constructor?
-        if self._res_body_pause_cb:
-            self._res_body_pause_cb(paused)
+        self.emit('pause', paused)
 
     def conn_closed(self):
         "The server connection has closed."
